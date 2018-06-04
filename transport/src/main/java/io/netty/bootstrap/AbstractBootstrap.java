@@ -279,15 +279,20 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     private ChannelFuture doBind(final SocketAddress localAddress) {
+        // 生成一个NIO中的channel并将其注册在selector选择器上（或其它IO多路复用的机制）
         final ChannelFuture regFuture = initAndRegister();
         final Channel channel = regFuture.channel();
         if (regFuture.cause() != null) {
             return regFuture;
         }
-
+        // 尝试下是否已经注册完成，当前线程总是尝试一次，之后交给eventloop线程池操作，这是bind链路上各类操作的特点
+        // 这种方式很好到利用了线程池带来到并发优势，后续的accept和read消息等操作也是通过eventLoop线程池完成
+        // 这种模型的再衍生，通过两组group处理不同事件（主从多线程模型），称为反应堆模型，后续代码应该会大量涉及（猜的）
         if (regFuture.isDone()) {
             // At this point we know that the registration was complete and successful.
+            // 各类调用都是异步操作，返回类似juc的Future的ChannelPromise
             ChannelPromise promise = channel.newPromise();
+            // 调用pipeline->HeadContext的bind最终由unsafe关联到JDK到NIO
             doBind0(regFuture, channel, localAddress, promise);
             return promise;
         } else {
@@ -315,6 +320,7 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
     }
 
     final ChannelFuture initAndRegister() {
+        // 从ReflectiveChannelFactory中通过反射获取到设置的channel实例
         Channel channel = null;
         try {
             channel = channelFactory.newChannel();
@@ -330,7 +336,10 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
             return new DefaultChannelPromise(new FailedChannel(), GlobalEventExecutor.INSTANCE).setFailure(t);
         }
 
-        ChannelFuture regFuture = config().group().register(channel);
+        EventLoopGroup group = config().group();
+        // 核心操作，根据channel类型将channel注册到选择器上selector（或KQueue、Epoll等）
+        // 这里谁注册谁是说起来真的别扭D:#，要注意这里也是交给线程池处理的（ES）
+        ChannelFuture regFuture = group.register(channel);
         if (regFuture.cause() != null) {
             if (channel.isRegistered()) {
                 channel.close();
@@ -353,9 +362,7 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
 
     abstract void init(Channel channel) throws Exception;
 
-    private static void doBind0(
-            final ChannelFuture regFuture, final Channel channel,
-            final SocketAddress localAddress, final ChannelPromise promise) {
+    private static void doBind0(final ChannelFuture regFuture, final Channel channel, final SocketAddress localAddress, final ChannelPromise promise) {
 
         // This method is invoked before channelRegistered() is triggered.  Give user handlers a chance to set up
         // the pipeline in its channelRegistered() implementation.
@@ -438,38 +445,32 @@ public abstract class AbstractBootstrap<B extends AbstractBootstrap<B, C>, C ext
         return copiedMap(attrs);
     }
 
-    static void setChannelOptions(
-            Channel channel, Map<ChannelOption<?>, Object> options, InternalLogger logger) {
-        for (Map.Entry<ChannelOption<?>, Object> e: options.entrySet()) {
+    static void setChannelOptions(Channel channel, Map<ChannelOption<?>, Object> options, InternalLogger logger) {
+        for (Map.Entry<ChannelOption<?>, Object> e : options.entrySet()) {
             setChannelOption(channel, e.getKey(), e.getValue(), logger);
         }
     }
 
-    static void setChannelOptions(
-            Channel channel, Map.Entry<ChannelOption<?>, Object>[] options, InternalLogger logger) {
-        for (Map.Entry<ChannelOption<?>, Object> e: options) {
+    static void setChannelOptions(Channel channel, Map.Entry<ChannelOption<?>, Object>[] options, InternalLogger logger) {
+        for (Map.Entry<ChannelOption<?>, Object> e : options) {
             setChannelOption(channel, e.getKey(), e.getValue(), logger);
         }
     }
 
     @SuppressWarnings("unchecked")
-    private static void setChannelOption(
-            Channel channel, ChannelOption<?> option, Object value, InternalLogger logger) {
+    private static void setChannelOption(Channel channel, ChannelOption<?> option, Object value, InternalLogger logger) {
         try {
             if (!channel.config().setOption((ChannelOption<Object>) option, value)) {
                 logger.warn("Unknown channel option '{}' for channel '{}'", option, channel);
             }
         } catch (Throwable t) {
-            logger.warn(
-                    "Failed to set channel option '{}' with value '{}' for channel '{}'", option, value, channel, t);
+            logger.warn("Failed to set channel option '{}' with value '{}' for channel '{}'", option, value, channel, t);
         }
     }
 
     @Override
     public String toString() {
-        StringBuilder buf = new StringBuilder()
-            .append(StringUtil.simpleClassName(this))
-            .append('(').append(config()).append(')');
+        StringBuilder buf = new StringBuilder().append(StringUtil.simpleClassName(this)).append('(').append(config()).append(')');
         return buf.toString();
     }
 
